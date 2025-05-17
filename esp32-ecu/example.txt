@@ -1,0 +1,225 @@
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
+
+// === Настройки ===
+#define UART_PORT UART_NUM_1        // Используем UART1
+#define UART_TX_PIN GPIO_NUM_4      // TX на GPIO4
+#define UART_RX_PIN GPIO_NUM_5      // RX на GPIO5
+#define BAUD_RATE 115200            // Скорость передачи
+#define TX_BUFFER_SIZE 6500         // Размер TX буфера
+#define RX_BUFFER_SIZE 2048          // Размер RX буфера
+
+static const char *TAG = "UART_ECHO";
+
+// Основная функция
+void app_main(void) {
+    // === Конфигурация UART1 ===
+    uart_config_t uart_config = {
+        .baud_rate = BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+
+    // Устанавливаем параметры UART
+    uart_param_config(UART_PORT, &uart_config);
+
+    // Устанавливаем пины UART1
+    uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    // Устанавливаем драйвер UART1
+    esp_err_t err = uart_driver_install(UART_PORT, TX_BUFFER_SIZE, RX_BUFFER_SIZE, 0, NULL, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Ошибка установки драйвера UART: %x", err);
+        return;
+    }
+
+    // Буфер для чтения
+    uint8_t rx_buffer[RX_BUFFER_SIZE];
+        const char *hello_msg = "Hello from ESP32-C6!\r\n";
+        uart_write_bytes(UART_PORT, hello_msg, strlen(hello_msg));
+
+        ESP_LOGI(TAG, "Sent: %s", hello_msg);
+
+    while (1) {
+        // === Периодическая отправка данных в UART ===
+        
+
+        // === Чтение входящих данных ===
+        int len = uart_read_bytes(UART_PORT, rx_buffer, RX_BUFFER_SIZE - 1, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+            ESP_LOGI(TAG, "Получено %d байт: %s", len, rx_buffer);
+
+            // echo
+            uart_write_bytes(UART_PORT, "%d", len);
+            uart_write_bytes(UART_PORT, "Received: ", len);
+            uart_write_bytes(UART_PORT, (const char *)rx_buffer, len);
+            uart_write_bytes(UART_PORT, "\r\n", 2);
+        }
+        // Пауза 2 секунды
+        // vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "esp_timer.h"
+#include "esp_system.h"
+#include <string.h>
+#include "esp_log.h"
+#include <string.h>
+#include <time.h>
+#include "esp_task_wdt.h"
+#include "esp_mac.h"
+// #include "driver/comparator.h"
+#include "tusb_cdc_acm.h"
+#include "esp_vfs_usb_serial_jtag.h"
+#include "driver/usb_serial_jtag.h"
+
+
+#define UART_NUM UART_NUM_0
+#define UART_TX_PIN 5
+#define UART_RX_PIN 6
+#define BUF_SIZE (1024)
+#define STEP_COUNT 23
+// Определение GPIO для встроенного светодиода ESP32-C3
+
+#define BUTTON_GPIO GPIO_NUM_0
+
+#define OUTPUT_PIN1 GPIO_NUM_3
+#define OUTPUT_PIN2 GPIO_NUM_4
+
+static QueueHandle_t gpio_evt_queue = NULL;
+static int led_state = 0; // Переменная для отслеживания состояния светодиода
+static int64_t last_press_time = 0; // Время последнего нажатия кнопки
+static volatile int64_t last_pin_diff = 0;
+static volatile int64_t rev_time = 0;
+static volatile uint8_t changed = 0;
+static volatile uint8_t pinCount = 0;
+static volatile uint64_t last_rev_time = 0;
+// Обработчик прерывания
+static void gpio_isr_handler(void* arg) {
+    uint32_t gpio_num = (uint32_t) arg;
+    uint64_t current_time = esp_timer_get_time(); // Получаем текущее время в микросекундах
+    uint64_t curr_pin_diff = (current_time - last_press_time);   //время между 2 последними "гвоздями"
+    if (curr_pin_diff < 700) {
+        return;
+    }
+
+
+    if (curr_pin_diff > (last_pin_diff * 2)) { // если сейчас промежуток сильно больше, чем прошлый
+        pinCount = 0;
+        rev_time = current_time - last_rev_time; //время оборота = текущее время - предыдущий момент оборота
+        changed = 1;                             //выставляем флаг
+        last_rev_time = current_time;            //выставляем предыдущий момент оборота
+
+        //здесь нужно запускать управление свечой
+    } else {
+        pinCount++;
+    } 
+
+    last_pin_diff = curr_pin_diff;             //обновляем промежуток для следующего раза
+    
+    last_press_time = current_time;              //обновляем время последнего срабатывания
+}
+
+
+
+void app_main(void) {
+    esp_task_wdt_deinit(); //отключаем watchdog timer
+
+
+    // uart_config_t uart_config = {
+    //     .baud_rate = 115200,
+    //     .data_bits = UART_DATA_8_BITS,
+    //     .parity = UART_PARITY_DISABLE,
+    //     .stop_bits = UART_STOP_BITS_1,
+    //     .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    // };
+    // uart_param_config(UART_NUM, &uart_config);
+    // uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    // uart_driver_install(UART_NUM, BUF_SIZE, BUF_SIZE, 0, NULL, 0);
+
+
+    // acomp_config_t acomp_cfg = {
+    //     .pos_channel = ACOMP_CHANNEL_GPIO0,   // Вход + (сигнал)
+    //     .neg_channel = ACOMP_CHANNEL_REF_DAC, // Вход − (опорный DAC)
+    //     .hysteresis = true,                   // Убираем дребезг
+    //     .filter_thres = 0,                     // Без дополнительной фильтрации
+    // };
+    // acomp_set_config(ACOMP_UNIT_0, &acomp_cfg);
+
+    // acomp_dac_config_t dac_cfg = {
+    //     .dac_ref = 128,  
+    // };
+
+    // acomp_set_dac_config(ACOMP_UNIT_0, &dac_cfg);
+    const tinyusb_config_t tusb_cfg = {
+        .device_descriptor = NULL,
+        .string_descriptor = NULL,
+        .external_phy = false
+    };
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+
+    const cdcacm_driver_t *cdc = tinyusb_cdcacm_get_by_index(0);
+    assert(cdc && "CDC не инициализирован!");
+
+    char buf[BUF_SIZE];
+
+    printf("USB CDC запущен. Ожидаю данные...\n");
+
+
+    // Настройка GPIO для кнопки
+    gpio_reset_pin(BUTTON_GPIO);
+    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_intr_type(BUTTON_GPIO, GPIO_INTR_POSEDGE);
+
+
+    // Установка обработчика прерываний
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BUTTON_GPIO, gpio_isr_handler, (void*) BUTTON_GPIO);
+
+    // acomp_register_isr(ACOMP_UNIT_0, gpio_isr_handler, NULL);
+
+    // acomp_enable_intr(ACOMP_UNIT_0, true);
+    // acomp_enable(ACOMP_UNIT_0);
+
+    // Инициализация времени последнего нажатия
+    last_press_time = esp_timer_get_time();
+    last_rev_time = last_press_time;
+
+    srand(time(NULL));
+
+
+    char json[128];
+    for (;;) {
+        if (changed) {
+
+
+            uint64_t rpm = 60000000 / rev_time;     //частота обротов в минуту = минута / время одного оборота
+
+            int32_t angle = rpm / 100;
+            printf("Since last gvozd' %lld mcs\n", last_pin_diff);
+            // printf("Rpm is %lld\n", rpm);
+            changed = 0;
+
+            snprintf(json, sizeof(json), "{\"rpm\": %lld, \"angle\": %ld}", rpm, angle);
+            printf("%s\n", json);
+
+            uart_write_bytes(UART_NUM, json, strlen(json));
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
