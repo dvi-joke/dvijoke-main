@@ -12,7 +12,7 @@
 #include "cJSON.h"
 
 // === Настройки UART ===
-#define UART_PORT UART_NUM_0
+#define UART_PORT UART_NUM_1
 #define UART_TX_PIN 5
 #define UART_RX_PIN 6
 #define BUF_SIZE (1024)
@@ -24,20 +24,30 @@
 // === Настройки таблицы зажигания ===
 #define MAX_RPM 6000               // Максимальные обороты
 #define RPM_STEP 100               // Шаг по RPM
-#define TABLE_SIZE (MAX_RPM / RPM_STEP + 1) // Размер массива углов
+#define TABLE_SIZE ((MAX_RPM / RPM_STEP) + 1) // Размер массива углов
 
-#define COIL_CHARGE_TIME 2000
+#define COIL_CHARGE_TIME_US 1000
+
+#define SAMPLE_COUNT 3
 
 static const char *TAG = "IGNITION_TABLE";
 
 // Переменные для расчёта RPM
-static int64_t last_press_time = 0;
-static volatile int64_t rev_time = 0;
-static volatile uint8_t changed = 0;
+static int64_t last_interrupt_time = 0;
+static volatile int64_t rev_period_us = 0;
+static volatile uint8_t rpm_updated = 0;
 static volatile uint64_t last_rev_time = 0;
+static volatile uint64_t rpm = 0;
 
+static volatile int64_t current_avg = 0;
+static volatile uint8_t sample_count = 0;
 // Таблица зажигания: angle_table[i] = угол для диапазона i*RPM_STEP - (i+1)*RPM_STEP
-static int angle_table[TABLE_SIZE] = {0};
+static int angle_table[TABLE_SIZE] = {60, 60, 60, 60, 60, 60, 60, 60, 60, 60,
+                                      60, 60, 60, 60, 60, 60, 60, 60, 60, 60,
+                                      60, 60, 60, 40, 40, 40, 40, 40, 30, 30,
+                                      30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+                                      30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+                                      30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30};
 
 // Таймер для управления транзистором
 esp_timer_handle_t transistor_on_timer = NULL;
@@ -55,33 +65,52 @@ void IRAM_ATTR transistor_off_callback(void* arg) {
 
 // === Обработчик прерываний от датчика ===
 static void IRAM_ATTR gpio_isr_handler(void* arg) {
-    uint64_t current_time = esp_timer_get_time();
-    uint64_t curr_pin_diff = current_time - last_press_time;
+    // ESP_EARLY_LOGI(TAG, "GPIO ISR fired");
 
-    if (curr_pin_diff < 700) return; // антидребезг
+    int64_t current_time = esp_timer_get_time();
+    int64_t diff = current_time - last_interrupt_time;
 
-    if (curr_pin_diff > (rev_time * 2)) {
-        rev_time = current_time - last_rev_time;
-        changed = 1;
-        last_rev_time = current_time;
-
-        // === Расчёт угла и задержки ===
-        uint64_t rpm = 60000000 / rev_time;
-        int index = rpm / RPM_STEP;
-        if (index >= TABLE_SIZE) index = TABLE_SIZE - 1;
-
-        int angle = angle_table[index];
-        uint64_t delay_us = (rev_time / 360) * angle;
-
-        // === Запуск таймеров ===
-        esp_timer_stop(transistor_on_timer);
-        esp_timer_start_once(transistor_on_timer, delay_us);
-
-        esp_timer_stop(transistor_off_timer);
-        esp_timer_start_once(transistor_off_timer, delay_us + COIL_CHARGE_TIME); // через 2 мс выключить
+    last_interrupt_time = current_time;
+    
+    // Антидребезг: игнорируем слишком маленькие/большие периоды
+    if (diff < 1000) {
+        return;
     }
 
-    last_press_time = current_time;
+    uint64_t new_rpm = 60000000ULL / diff;
+
+    if (new_rpm > rpm * 3 / 2 && rpm > 700) {
+        return;
+    }
+
+    
+
+    // Обновляем время последнего прерывания
+    // last_interrupt_time = current_time;
+
+    // Сохраняем текущий период
+    rev_period_us = diff;
+    rpm_updated = 1;
+
+    // Рассчитываем RPM
+    rpm = 60000000ULL / rev_period_us;
+
+    // === Расчёт угла зажигания и управление катушкой ===
+    int index = rpm / RPM_STEP;
+    if (index >= TABLE_SIZE) index = TABLE_SIZE - 1;
+    int angle_deg = angle_table[index];
+    uint64_t delay_us = (rev_period_us * (angle_deg)) / 360;
+
+    if (delay_us < COIL_CHARGE_TIME_US) {
+        delay_us = COIL_CHARGE_TIME_US;
+    }
+
+    // Запуск таймеров
+    esp_timer_stop(transistor_on_timer);
+    esp_timer_start_once(transistor_on_timer, delay_us - COIL_CHARGE_TIME_US);
+
+    esp_timer_stop(transistor_off_timer);
+    esp_timer_start_once(transistor_off_timer, delay_us);
 }
 
 
@@ -131,12 +160,12 @@ void app_main(void) {
     };
     uart_param_config(UART_PORT, &uart_config);
     uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_driver_install(UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0);
+    uart_driver_install(UART_PORT, BUF_SIZE, BUF_SIZE, 0, NULL, 0);
 
     // === Инициализация GPIO ===
     gpio_reset_pin(BUTTON_GPIO);
     gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLDOWN_ONLY);
+    // gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLDOWN_ONLY);
     gpio_set_intr_type(BUTTON_GPIO, GPIO_INTR_POSEDGE);
 
     gpio_reset_pin(OUTPUT_PIN);
@@ -161,18 +190,23 @@ void app_main(void) {
 
 
     // === Запуск задачи чтения UART ===
-    xTaskCreate(uart_read_task, "uart_read_task", 2048, NULL, 10, NULL);
+    xTaskCreate(uart_read_task, "uart_read_task", 4096, NULL, 10, NULL);
 
     // === Основной цикл ===
     char json[128];
     while (1) {
-        if (changed && rev_time > 0) {
-            uint64_t rpm = 60000000 / rev_time;
-            snprintf(json, sizeof(json), "{\"rpm\": %lld}", rpm);
+        if (rpm_updated) {
+            uint64_t rpm = 60000000 / rev_period_us;
+            int index = rpm / RPM_STEP;
+            if (index >= TABLE_SIZE) index = TABLE_SIZE - 1;
+
+            int angle = angle_table[index];
+            snprintf(json, sizeof(json), "{\"rpm\": %lld, \"angle\": %d}", rpm, angle);
             uart_write_bytes(UART_PORT, json, strlen(json));
             uart_write_bytes(UART_PORT, "\r\n", 2);
-            changed = 0;
+            ESP_LOGI(TAG, "{\"rpm\": %lld, \"angle\": %d}", rpm, angle);
+            rpm_updated = 0;
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
