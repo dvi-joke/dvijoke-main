@@ -20,6 +20,7 @@
 // === Настройки датчика оборотов ===
 #define BUTTON_GPIO GPIO_NUM_0     // Входной сигнал (например, датчик Холла)
 #define OUTPUT_PIN GPIO_NUM_3      // Пин управления транзистором
+#define OUTPUT_PIN2 GPIO_NUM_8     // транзистор второй катушки
 
 // === Настройки таблицы зажигания ===
 #define MAX_RPM 6000               // Максимальные обороты
@@ -42,25 +43,32 @@ static volatile uint64_t rpm = 0;
 static volatile int64_t current_avg = 0;
 static volatile uint8_t sample_count = 0;
 // Таблица зажигания: angle_table[i] = угол для диапазона i*RPM_STEP - (i+1)*RPM_STEP
-static int angle_table[TABLE_SIZE] = {60, 60, 60, 60, 60, 60, 60, 60, 60, 60,
-                                      60, 60, 60, 60, 60, 60, 60, 60, 60, 60,
-                                      60, 60, 60, 40, 40, 40, 40, 40, 30, 30,
-                                      30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
-                                      30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
-                                      30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30};
+static int angle_table[TABLE_SIZE] = {30};
 
 // Таймер для управления транзистором
-esp_timer_handle_t transistor_on_timer = NULL;
-esp_timer_handle_t transistor_off_timer = NULL;
+esp_timer_handle_t transistor_on_timer14 = NULL;
+esp_timer_handle_t transistor_off_timer14 = NULL;
+esp_timer_handle_t transistor_on_timer23 = NULL;
+esp_timer_handle_t transistor_off_timer23 = NULL;
 
 // === Включение транзистора ===
-void IRAM_ATTR transistor_on_callback(void* arg) {
+void IRAM_ATTR transistor_on_callback14(void* arg) {
     gpio_set_level(OUTPUT_PIN, 1); // Включаем транзистор
 }
 
 // === Выключение транзистора через 2 мс ===
-void IRAM_ATTR transistor_off_callback(void* arg) {
+void IRAM_ATTR transistor_off_callback14(void* arg) {
     gpio_set_level(OUTPUT_PIN, 0); // Выключаем транзистор
+}
+
+// === Включение транзистора ===
+void IRAM_ATTR transistor_on_callback23(void* arg) {
+    gpio_set_level(OUTPUT_PIN2, 1); // Включаем транзистор
+}
+
+// === Выключение транзистора через 2 мс ===
+void IRAM_ATTR transistor_off_callback23(void* arg) {
+    gpio_set_level(OUTPUT_PIN2, 0); // Выключаем транзистор
 }
 
 // === Обработчик прерываний от датчика ===
@@ -70,13 +78,13 @@ static void IRAM_ATTR gpio_isr_handler(void* arg) {
     int64_t current_time = esp_timer_get_time();
     int64_t diff = current_time - last_interrupt_time;
 
-    last_interrupt_time = current_time;
+    // last_interrupt_time = current_time;
     
     // Антидребезг: игнорируем слишком маленькие/большие периоды
     if (diff < 1000) {
         return;
     }
-
+    last_interrupt_time = current_time;
     uint64_t new_rpm = 60000000ULL / diff;
 
     if (new_rpm > rpm * 3 / 2 && rpm > 700) {
@@ -105,12 +113,20 @@ static void IRAM_ATTR gpio_isr_handler(void* arg) {
         delay_us = COIL_CHARGE_TIME_US;
     }
 
-    // Запуск таймеров
-    esp_timer_stop(transistor_on_timer);
-    esp_timer_start_once(transistor_on_timer, delay_us - COIL_CHARGE_TIME_US);
+    uint64_t delay_us23 = delay_us + (rev_period_us / 2);
 
-    esp_timer_stop(transistor_off_timer);
-    esp_timer_start_once(transistor_off_timer, delay_us);
+    // Запуск таймеров
+    esp_timer_stop(transistor_on_timer14);
+    esp_timer_start_once(transistor_on_timer14, delay_us - COIL_CHARGE_TIME_US);
+
+    esp_timer_stop(transistor_off_timer14);
+    esp_timer_start_once(transistor_off_timer14, delay_us);
+
+    esp_timer_stop(transistor_on_timer23);
+    esp_timer_start_once(transistor_on_timer23, delay_us23 - COIL_CHARGE_TIME_US);
+
+    esp_timer_stop(transistor_off_timer23);
+    esp_timer_start_once(transistor_off_timer23, delay_us23);
 }
 
 
@@ -171,22 +187,38 @@ void app_main(void) {
     gpio_reset_pin(OUTPUT_PIN);
     gpio_set_direction(OUTPUT_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(OUTPUT_PIN, 0);
+    gpio_reset_pin(OUTPUT_PIN2);
+    gpio_set_direction(OUTPUT_PIN2, GPIO_MODE_OUTPUT);
+    gpio_set_level(OUTPUT_PIN2, 0);
 
     gpio_install_isr_service(0);
     gpio_isr_handler_add(BUTTON_GPIO, gpio_isr_handler, (void*)BUTTON_GPIO);
 
     // === Создание одноразового таймера ===
-    const esp_timer_create_args_t on_timer_args = {
-        .callback = &transistor_on_callback,
-        .name = "on_timer"
+    const esp_timer_create_args_t on_timer_args14 = {
+        .callback = &transistor_on_callback14,
+        .name = "on_timer14"
     };
-    ESP_ERROR_CHECK(esp_timer_create(&on_timer_args, &transistor_on_timer));
+    ESP_ERROR_CHECK(esp_timer_create(&on_timer_args14, &transistor_on_timer14));
 
     const esp_timer_create_args_t off_timer_args = {
-        .callback = &transistor_off_callback,
-        .name = "off_timer"
+        .callback = &transistor_off_callback14,
+        .name = "off_timer14"
     };
-    ESP_ERROR_CHECK(esp_timer_create(&off_timer_args, &transistor_off_timer));
+    ESP_ERROR_CHECK(esp_timer_create(&off_timer_args, &transistor_off_timer14));
+
+    // === Создание одноразового таймера ===
+    const esp_timer_create_args_t on_timer_args23 = {
+        .callback = &transistor_on_callback23,
+        .name = "on_timer23"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&on_timer_args23, &transistor_on_timer23));
+
+    const esp_timer_create_args_t off_timer_args23 = {
+        .callback = &transistor_off_callback23,
+        .name = "off_timer23"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&off_timer_args23, &transistor_off_timer23));
 
 
     // === Запуск задачи чтения UART ===
