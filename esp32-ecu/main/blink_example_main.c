@@ -10,6 +10,12 @@
 #include "string.h"
 #include "esp_log.h"
 #include "cJSON.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+
+
+#define NVS_NAMESPACE "ignition"
+#define NVS_TABLE_KEY "angle_table"
 
 // === Настройки UART ===
 #define UART_PORT UART_NUM_1
@@ -19,7 +25,7 @@
 
 // === Настройки датчика оборотов ===
 #define BUTTON_GPIO GPIO_NUM_0     // Входной сигнал (например, датчик Холла)
-#define OUTPUT_PIN GPIO_NUM_3      // Пин управления транзистором
+#define OUTPUT_PIN GPIO_NUM_7      // Пин управления транзистором
 #define OUTPUT_PIN2 GPIO_NUM_8     // транзистор второй катушки
 
 // === Настройки таблицы зажигания ===
@@ -43,7 +49,7 @@ static volatile uint64_t rpm = 0;
 static volatile int64_t current_avg = 0;
 static volatile uint8_t sample_count = 0;
 // Таблица зажигания: angle_table[i] = угол для диапазона i*RPM_STEP - (i+1)*RPM_STEP
-static int angle_table[TABLE_SIZE] = {30};
+static int angle_table[TABLE_SIZE] = {30, 30, };
 
 // Таймер для управления транзистором
 esp_timer_handle_t transistor_on_timer14 = NULL;
@@ -56,7 +62,7 @@ void IRAM_ATTR transistor_on_callback14(void* arg) {
     gpio_set_level(OUTPUT_PIN, 1); // Включаем транзистор
 }
 
-// === Выключение транзистора через 2 мс ===
+// === Выключение транзистора через 1 мс ===
 void IRAM_ATTR transistor_off_callback14(void* arg) {
     gpio_set_level(OUTPUT_PIN, 0); // Выключаем транзистор
 }
@@ -66,10 +72,53 @@ void IRAM_ATTR transistor_on_callback23(void* arg) {
     gpio_set_level(OUTPUT_PIN2, 1); // Включаем транзистор
 }
 
-// === Выключение транзистора через 2 мс ===
+// === Выключение транзистора через 1 мс ===
 void IRAM_ATTR transistor_off_callback23(void* arg) {
     gpio_set_level(OUTPUT_PIN2, 0); // Выключаем транзистор
 }
+
+void save_angle_table_to_nvs(int *table, size_t length) {
+    nvs_handle_t my_handle;
+    esp_err_t err;
+
+    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Ошибка открытия NVS: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_set_blob(my_handle, NVS_TABLE_KEY, table, length * sizeof(int));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Ошибка записи в NVS: %s", esp_err_to_name(err));
+    } else {
+        nvs_commit(my_handle);
+        ESP_LOGI(TAG, "Таблица сохранена в NVS");
+    }
+
+    nvs_close(my_handle);
+}
+
+void load_angle_table_from_nvs(int *table, size_t length) {
+    nvs_handle_t my_handle;
+    esp_err_t err;
+
+    err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &my_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS не содержит таблицу зажигания");
+        return;
+    }
+
+    size_t size = length * sizeof(int);
+    err = nvs_get_blob(my_handle, NVS_TABLE_KEY, table, &size);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Ошибка чтения таблицы из NVS: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Таблица загружена из NVS");
+    }
+
+    nvs_close(my_handle);
+}
+
 
 // === Обработчик прерываний от датчика ===
 static void IRAM_ATTR gpio_isr_handler(void* arg) {
@@ -87,7 +136,7 @@ static void IRAM_ATTR gpio_isr_handler(void* arg) {
     last_interrupt_time = current_time;
     uint64_t new_rpm = 60000000ULL / diff;
 
-    if (new_rpm > rpm * 3 / 2 && rpm > 700) {
+    if (new_rpm > rpm * 49 / 40 && rpm > 700) {
         return;
     }
 
@@ -106,7 +155,7 @@ static void IRAM_ATTR gpio_isr_handler(void* arg) {
     // === Расчёт угла зажигания и управление катушкой ===
     int index = rpm / RPM_STEP;
     if (index >= TABLE_SIZE) index = TABLE_SIZE - 1;
-    int angle_deg = angle_table[index];
+    int angle_deg = angle_table[index] - 10;
     uint64_t delay_us = (rev_period_us * (angle_deg)) / 360;
 
     if (delay_us < COIL_CHARGE_TIME_US) {
@@ -148,6 +197,10 @@ void parse_angle_table(const char *json_str) {
     }
 
     ESP_LOGI(TAG, "Таблица зажигания загружена");
+
+    // Сохраняем новую таблицу в NVS
+    save_angle_table_to_nvs(angle_table, TABLE_SIZE);
+
     cJSON_Delete(root);
 }
 
@@ -166,6 +219,17 @@ void uart_read_task(void *pvParameters) {
 
 // === Основная функция ===
 void app_main(void) {
+    // === Инициализация NVS ===
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    load_angle_table_from_nvs(angle_table, TABLE_SIZE);
+
+
     // === Инициализация UART ===
     uart_config_t uart_config = {
         .baud_rate = 115200,
@@ -226,19 +290,24 @@ void app_main(void) {
 
     // === Основной цикл ===
     char json[128];
+    int angle;
     while (1) {
         if (rpm_updated) {
             uint64_t rpm = 60000000 / rev_period_us;
             int index = rpm / RPM_STEP;
             if (index >= TABLE_SIZE) index = TABLE_SIZE - 1;
 
-            int angle = angle_table[index];
-            snprintf(json, sizeof(json), "{\"rpm\": %lld, \"angle\": %d}", rpm, angle);
-            uart_write_bytes(UART_PORT, json, strlen(json));
-            uart_write_bytes(UART_PORT, "\r\n", 2);
-            ESP_LOGI(TAG, "{\"rpm\": %lld, \"angle\": %d}", rpm, angle);
-            rpm_updated = 0;
+            angle = angle_table[index];
+            
+        } else {
+            rpm = 0;
+            angle = angle_table[0];
         }
+        snprintf(json, sizeof(json), "{\"rpm\": %lld, \"angle\": %d}", rpm, angle);
+        uart_write_bytes(UART_PORT, json, strlen(json));
+        uart_write_bytes(UART_PORT, "\r\n", 2);
+        ESP_LOGI(TAG, "{\"rpm\": %lld, \"angle\": %d}", rpm, angle);
+        rpm_updated = 0;
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
